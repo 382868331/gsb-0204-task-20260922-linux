@@ -31,10 +31,34 @@
 所有非法输入抛出 ValidationError（ValueError 子类），消息定位到具体
 个体 ID / 字段。本库不做任何静默纠正，输出全部为精确离散结果，
 不涉及浮点计算。
+
+第二入口（多位点候选父母对分配）：
+
+    assign_parents(genotypes, candidates, *, node_budget=DEFAULT_NODE_BUDGET)
+        -> AssignmentResult
+
+- genotypes: dict，个体 ID -> {位点键: 基因型}。位点键为非 bool 的 int
+  或非空 str，全体位点共 1..MAX_ASSIGN_LOCI=4 个；基因型规则同 check。
+  父母可只在部分位点有观测（未观测位点取 0/1/2），也可完全不出现；
+  每个孩子必须在全部位点上有观测。
+- candidates: dict，孩子 ID -> 1..MAX_ASSIGN_PAIRS=3 个候选父母对，
+  每对为 (father_id_or_None, mother_id_or_None)；孩子数 1..MAX_ASSIGN_CHILDREN=3。
+  None 槽位语义同 check（独立未知创始者）。候选父母不能是另一个被分配
+  的孩子（本接口只覆盖两层分配，多代请用 check）。
+- 每个孩子选定**一对**父母，该选择对全部位点生效，不允许逐位点换父母。
+  至多 3^3=27 种组合，全部枚举；组合内各位点独立调用旧遗传规则求解
+  （未观测共享父母的耦合仍在单个位点内精确处理）。
+- 返回 AssignmentResult：
+    status="feasible":   assignments 为全部可行选择 ParentAssignment（按
+                         候选下标元组字典序），每个含 choice/pairs/空冲突；
+    status="infeasible": 没有任何选择可行；conflicts 给出每种被否决选择
+                         及其不一致位点元组 loci_conflicts（非空）；
+    status="unknown":    节点预算耗尽，assignments/conflicts 均为空元组。
 """
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Optional
@@ -43,11 +67,17 @@ __all__ = [
     "check",
     "CheckResult",
     "ConflictReport",
+    "assign_parents",
+    "AssignmentResult",
+    "ParentAssignment",
     "MendelError",
     "ValidationError",
     "MAX_INDIVIDUALS",
     "DEFAULT_NODE_BUDGET",
     "MAX_MINIMAL_SETS",
+    "MAX_ASSIGN_CHILDREN",
+    "MAX_ASSIGN_PAIRS",
+    "MAX_ASSIGN_LOCI",
     "GENOTYPES",
 ]
 
@@ -55,6 +85,11 @@ MAX_INDIVIDUALS = 20
 DEFAULT_NODE_BUDGET = 100_000
 MAX_MINIMAL_SETS = 256
 GENOTYPES = (0, 1, 2)
+
+# 候选父母对分配的题面上限。
+MAX_ASSIGN_CHILDREN = 3
+MAX_ASSIGN_PAIRS = 3
+MAX_ASSIGN_LOCI = 4
 
 # 基因型 g 在减数分裂中可传出的等位（0=参考，1=替代）。
 _TRANSMIT = ((0,), (0, 1), (1,))
@@ -120,6 +155,27 @@ class CheckResult:
     nodes_used: int
 
 
+@dataclass(frozen=True)
+class ParentAssignment:
+    """assign_parents() 中一个孩子的父母选择。"""
+
+    child: str
+    pair_index: int                     # 该孩子候选列表中的下标（0 起）
+    pair: tuple                         # (father_id_or_None, mother_id_or_None)
+    loci_conflicts: tuple = ()          # 该选择被否决时：不一致位点键元组；可行时为空
+
+
+@dataclass(frozen=True)
+class AssignmentResult:
+    """assign_parents() 的返回值。status ∈ {"feasible", "infeasible", "unknown"}。"""
+
+    status: str
+    assignments: tuple   # feasible: ParentAssignment 元组的元组（全部可行组合）
+    conflicts: tuple     # infeasible: 每个被否决组合一条（每孩一个 ParentAssignment）
+    loci: tuple          # 参与校验的全部位点键，按规范顺序
+    nodes_used: int
+
+
 class _Model:
     """内部求解模型：实个体变量 + 每个缺失亲本槽位一个独立合成创始者变量。"""
 
@@ -172,13 +228,17 @@ def _check_acyclic(pedigree: Mapping) -> None:
                 path.pop()
 
 
-def _validate_and_build(pedigree, observations, node_budget) -> _Model:
+def _validate_budget(node_budget) -> None:
     if isinstance(node_budget, bool) or not isinstance(node_budget, int):
         raise ValidationError(
             f"node_budget must be an int >= 1 (bool/float rejected), got {node_budget!r}"
         )
     if node_budget < 1:
         raise ValidationError(f"node_budget must be >= 1, got {node_budget!r}")
+
+
+def _validate_and_build(pedigree, observations, node_budget) -> _Model:
+    _validate_budget(node_budget)
 
     if isinstance(pedigree, (str, bytes)) or not isinstance(pedigree, Mapping):
         raise ValidationError(
@@ -445,5 +505,285 @@ def check(pedigree, observations, *, node_budget: int = DEFAULT_NODE_BUDGET) -> 
             status="unknown",
             feasible_genotypes=None,
             conflict=None,
+            nodes_used=node_budget,
+        )
+
+
+# ------------------------------------------------ 多位点候选父母对分配
+
+def _locus_sort_key(locus):
+    # int 位点按数值在前，str 位点按字典序在后；同类型内自然排序。
+    return (0, locus) if isinstance(locus, int) else (1, locus)
+
+
+def _validate_assignment_input(genotypes, candidates):
+    """校验 assign_parents 输入，返回 (child_ids, loci, pair_lists, genotype_map)。
+
+    child_ids 升序；loci 为规范顺序的位点元组；pair_lists 为 {child: [(fa,mo),...]}；
+    genotype_map 为 {id: {locus: g}}（已是合法 genotype dict 视图）。
+    """
+    if isinstance(genotypes, (str, bytes)) or not isinstance(genotypes, Mapping):
+        raise ValidationError(
+            f"genotypes must be a mapping {{id: {{locus: genotype}}}}, "
+            f"got {type(genotypes).__name__}"
+        )
+    if not genotypes:
+        raise ValidationError("genotypes must contain at least one genotyped individual")
+    for pid in genotypes:
+        if not isinstance(pid, str) or not pid:
+            raise ValidationError(f"individual id must be a non-empty str, got {pid!r}")
+
+    loci = set()
+    gmap = {}
+    for pid, prof in genotypes.items():
+        if isinstance(prof, (str, bytes)) or not isinstance(prof, Mapping):
+            raise ValidationError(
+                f"genotypes[{pid!r}] must be a mapping {{locus: 0|1|2}}, "
+                f"got {type(prof).__name__}"
+            )
+        if not prof:
+            raise ValidationError(f"genotypes[{pid!r}] has no locus observations")
+        row = {}
+        for locus, g in prof.items():
+            if isinstance(locus, bool) or not isinstance(locus, (int, str)):
+                raise ValidationError(
+                    f"genotypes[{pid!r}] locus key must be an int or non-empty str, "
+                    f"got {locus!r}"
+                )
+            if isinstance(locus, str) and not locus:
+                raise ValidationError(f"genotypes[{pid!r}] has an empty str locus key")
+            if locus in row:
+                raise ValidationError(f"genotypes[{pid!r}] lists locus {locus!r} twice")
+            if isinstance(g, bool) or not isinstance(g, int):
+                raise ValidationError(
+                    f"genotypes[{pid!r}][{locus!r}] genotype must be an int in "
+                    f"{{0, 1, 2}} (bool/float rejected), got {g!r}"
+                )
+            if g not in GENOTYPES:
+                raise ValidationError(
+                    f"genotypes[{pid!r}][{locus!r}] genotype must be in {{0, 1, 2}}, "
+                    f"got {g!r}"
+                )
+            row[locus] = g
+            loci.add(locus)
+        gmap[pid] = row
+    if len(loci) > MAX_ASSIGN_LOCI:
+        raise ValidationError(
+            f"got {len(loci)} loci, limit is {MAX_ASSIGN_LOCI}"
+        )
+    loci_tuple = tuple(sorted(loci, key=_locus_sort_key))
+
+    if isinstance(candidates, (str, bytes)) or not isinstance(candidates, Mapping):
+        raise ValidationError(
+            f"candidates must be a mapping {{child_id: [(father, mother), ...]}}, "
+            f"got {type(candidates).__name__}"
+        )
+    if not 1 <= len(candidates) <= MAX_ASSIGN_CHILDREN:
+        raise ValidationError(
+            f"number of children must be in 1..{MAX_ASSIGN_CHILDREN}, "
+            f"got {len(candidates)}"
+        )
+    child_ids = sorted(candidates)
+    pair_lists = {}
+    for cid in child_ids:
+        if not isinstance(cid, str) or not cid:
+            raise ValidationError(f"child id must be a non-empty str, got {cid!r}")
+        pairs = candidates[cid]
+        if isinstance(pairs, (str, bytes)) or not isinstance(pairs, (tuple, list)):
+            raise ValidationError(
+                f"candidates[{cid!r}] must be a list of (father, mother) pairs, "
+                f"got {pairs!r}"
+            )
+        if not 1 <= len(pairs) <= MAX_ASSIGN_PAIRS:
+            raise ValidationError(
+                f"candidates[{cid!r}] must have 1..{MAX_ASSIGN_PAIRS} pairs, "
+                f"got {len(pairs)}"
+            )
+        plist = []
+        seen = set()
+        for j, pair in enumerate(pairs):
+            if (
+                isinstance(pair, (str, bytes))
+                or not isinstance(pair, (tuple, list))
+                or len(pair) != 2
+            ):
+                raise ValidationError(
+                    f"candidates[{cid!r}][{j}] must be a (father, mother) pair, "
+                    f"got {pair!r}"
+                )
+            fa, mo = pair
+            for role, par in (("father", fa), ("mother", mo), ):
+                if par is not None and not isinstance(par, str):
+                    raise ValidationError(
+                        f"candidates[{cid!r}][{j}] {role} must be None or a "
+                        f"member id str, got {par!r}"
+                    )
+                if par == "":
+                    raise ValidationError(
+                        f"candidates[{cid!r}][{j}] {role} is an empty id"
+                    )
+            if fa == cid or mo == cid:
+                raise ValidationError(
+                    f"candidates[{cid!r}][{j}] lists the child itself as a parent"
+                )
+            t = (fa, mo)
+            if t in seen:
+                raise ValidationError(
+                    f"candidates[{cid!r}] contains duplicate pair {list(t)}"
+                )
+            seen.add(t)
+            plist.append(t)
+        pair_lists[cid] = plist
+
+    child_set = set(child_ids)
+    for cid in child_ids:
+        if cid not in gmap:
+            raise ValidationError(
+                f"child {cid!r} has no genotype observations (children must be "
+                f"observed at every locus)"
+            )
+        missing = [l for l in loci_tuple if l not in gmap[cid]]
+        if missing:
+            raise ValidationError(
+                f"child {cid!r} is missing observations at loci {list(missing)}; "
+                f"children must be observed at every locus"
+            )
+        for j, (fa, mo) in enumerate(pair_lists[cid]):
+            if fa in child_set or mo in child_set:
+                par = fa if fa in child_set else mo
+                raise ValidationError(
+                    f"candidates[{cid!r}][{j}] parent {par!r} is itself an "
+                    f"assigned child (multi-generation assignment is not supported; "
+                    f"use check())"
+                )
+    return child_ids, loci_tuple, pair_lists, gmap
+
+
+def _locus_model(child_ids, chosen, gmap, locus):
+    """为给定候选组合构造单位点的 (pedigree, observations)。
+
+    chosen: {child: (fa, mo)}。父母无论是否观测都是家系创始者。
+    """
+    pedigree = {}
+    for cid in child_ids:
+        fa, mo = chosen[cid]
+        pedigree[cid] = (fa, mo)
+        if fa is not None and fa not in pedigree:
+            pedigree[fa] = (None, None)
+        if mo is not None and mo not in pedigree:
+            pedigree[mo] = (None, None)
+    observations = {}
+    for pid in pedigree:  # 只观测家系成员；未被引用的基因型个体与该组合无关
+        row = gmap.get(pid)
+        if row is not None and locus in row:
+            observations[pid] = row[locus]
+    return pedigree, observations
+
+
+def _locus_feasible(child_ids, chosen, gmap, locus, budget) -> bool:
+    pedigree, observations = _locus_model(child_ids, chosen, gmap, locus)
+    model = _validate_and_build(pedigree, observations, budget.limit)
+    return _solve_obs(model, model.obs_ids, budget) is not None
+
+
+def assign_parents(genotypes, candidates, *, node_budget: int = DEFAULT_NODE_BUDGET):
+    """在有限候选父母对中为每个孩子选择同一对（跨全部位点）父母。
+
+    最多 3 个孩子、每人 3 组候选、4 个位点；枚举至多 27 种组合，逐组合
+    校验全部位点。契约见模块 docstring。
+    """
+    _validate_budget(node_budget)
+    child_ids, loci_tuple, pair_lists, gmap = _validate_assignment_input(
+        genotypes, candidates
+    )
+    budget = _Budget(node_budget)
+    try:
+        feasible_combos = []
+        ranges = [range(len(pair_lists[cid])) for cid in child_ids]
+        for idxs in itertools.product(*ranges):
+            chosen = {
+                cid: pair_lists[cid][k] for cid, k in zip(child_ids, idxs)
+            }
+            ok = True
+            for locus in loci_tuple:
+                if not _locus_feasible(child_ids, chosen, gmap, locus, budget):
+                    ok = False
+                    break
+            if ok:
+                feasible_combos.append(
+                    tuple(
+                        ParentAssignment(
+                            child=cid,
+                            pair_index=k,
+                            pair=chosen[cid],
+                            loci_conflicts=(),
+                        )
+                        for cid, k in zip(child_ids, idxs)
+                    )
+                )
+        if feasible_combos:
+            return AssignmentResult(
+                status="feasible",
+                assignments=tuple(feasible_combos),
+                conflicts=(),
+                loci=loci_tuple,
+                nodes_used=budget.used,
+            )
+
+        # 全部组合被否决：对每个被否决组合做逐位点归因。孩子三元组只有在
+        # 共享被选父母时才互相耦合，故枚举孩子的全部子集（至多 2^3=8 个），
+        # 找出使该位点不可行的极小孩子子集（极小不可行核）：独立三元组冲突
+        # 时只标记孩子本人，共享父母导致的联合冲突则同时标记相关孩子。
+        rejected = []
+        n_children = len(child_ids)
+        ranges = [range(len(pair_lists[cid])) for cid in child_ids]
+        for idxs in itertools.product(*ranges):
+            chosen = {
+                cid: pair_lists[cid][k] for cid, k in zip(child_ids, idxs)
+            }
+            per_child_bad = {cid: [] for cid in child_ids}
+            for locus in loci_tuple:
+                infeasible_subsets = []
+                for mask in range(1, 1 << n_children):
+                    sub = [child_ids[b] for b in range(n_children) if mask & (1 << b)]
+                    chosen_t = {c: chosen[c] for c in sub}
+                    ped_t, obs_t = _locus_model(sub, chosen_t, gmap, locus)
+                    m_t = _validate_and_build(ped_t, obs_t, budget.limit)
+                    if _solve_obs(m_t, m_t.obs_ids, budget) is None:
+                        infeasible_subsets.append(frozenset(sub))
+                if not infeasible_subsets:
+                    continue  # 该位点在此组合下可行
+                cores = [
+                    s for s in infeasible_subsets
+                    if not any(t < s for t in infeasible_subsets)
+                ]
+                for core in cores:
+                    for cid in core:
+                        if locus not in per_child_bad[cid]:
+                            per_child_bad[cid].append(locus)
+            rejected.append(
+                tuple(
+                    ParentAssignment(
+                        child=cid,
+                        pair_index=k,
+                        pair=chosen[cid],
+                        loci_conflicts=tuple(per_child_bad[cid]),
+                    )
+                    for cid, k in zip(child_ids, idxs)
+                )
+            )
+        return AssignmentResult(
+            status="infeasible",
+            assignments=(),
+            conflicts=tuple(rejected),
+            loci=loci_tuple,
+            nodes_used=budget.used,
+        )
+    except _BudgetExhausted:
+        return AssignmentResult(
+            status="unknown",
+            assignments=(),
+            conflicts=(),
+            loci=loci_tuple,
             nodes_used=node_budget,
         )
