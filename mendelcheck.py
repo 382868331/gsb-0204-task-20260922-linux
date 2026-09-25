@@ -31,6 +31,33 @@
 所有非法输入抛出 ValidationError（ValueError 子类），消息定位到具体
 个体 ID / 字段。本库不做任何静默纠正，输出全部为精确离散结果，
 不涉及浮点计算。
+
+软代价优化（新增公开接口）：
+
+    optimize(pedigree, observations, costs=None, *, node_budget=DEFAULT_NODE_BUDGET)
+        -> OptimizeResult
+
+- costs: None 或 dict，个体 ID -> (c0, c1, c2) 三项序列。cv 为严格 int 且
+  >= 0（拒绝 bool/float/负数），表示该个体取基因型 v 的代价；cv 为 None
+  表示禁止该基因型。未列入 costs 的个体视为 (0, 0, 0)。
+- 硬观测仍然严格：先按 observations 把候选限制为观测值，再施加禁止项；
+  观测与禁止冲突（或传递约束不可满足）一律证明无解，不能用高代价放过。
+- 目标：在所有满足孟德尔传递约束与硬观测的完整指派上，最小化全家系
+  总代价（仅实个体计费，缺失父母的合成创始者不计代价）。
+
+返回 OptimizeResult：
+- status == "optimal":    已证明最优。min_cost 为最小总代价；
+                          optimal_genotypes 为 {ID: frozenset(在最优解中
+                          可取的基因型)}，覆盖全部个体；witness 为一份确定
+                          性最优见证（同分时按人物 ID 字典序的基因型序列
+                          取字典序最小者）；best_cost_bound == min_cost。
+- status == "infeasible": 证明无可行指派（传递约束/硬观测/禁止项冲突）。
+- status == "unknown":    节点预算耗尽。best_cost_bound 为已找到的最好
+                          可行总代价（可行上界，未找到可行解则为 None）；
+                          若最优代价已证明但最优基因型集合未枚举完，
+                          min_cost 为该已证明最优值，否则为 None；
+                          optimal_genotypes 与 witness 必为 None —— 绝不
+                          给出未经证明的“所有最优”。
 """
 
 from __future__ import annotations
@@ -41,7 +68,9 @@ from typing import Optional
 
 __all__ = [
     "check",
+    "optimize",
     "CheckResult",
+    "OptimizeResult",
     "ConflictReport",
     "MendelError",
     "ValidationError",
@@ -117,6 +146,18 @@ class CheckResult:
     status: str
     feasible_genotypes: Optional[dict]
     conflict: Optional[ConflictReport]
+    nodes_used: int
+
+
+@dataclass(frozen=True)
+class OptimizeResult:
+    """optimize() 的返回值。status ∈ {"optimal", "infeasible", "unknown"}。"""
+
+    status: str
+    min_cost: Optional[int]
+    optimal_genotypes: Optional[dict]
+    witness: Optional[dict]
+    best_cost_bound: Optional[int]
     nodes_used: int
 
 
@@ -445,5 +486,217 @@ def check(pedigree, observations, *, node_budget: int = DEFAULT_NODE_BUDGET) -> 
             status="unknown",
             feasible_genotypes=None,
             conflict=None,
+            nodes_used=node_budget,
+        )
+
+
+# ---------------------------------------------------------------- 软代价优化
+
+def _validate_costs(pedigree, costs) -> dict:
+    """校验 costs，返回 {ID: (c0, c1, c2)}（元素为 None 或非负 int）。"""
+    if costs is None:
+        return {}
+    if isinstance(costs, (str, bytes)) or not isinstance(costs, Mapping):
+        raise ValidationError(
+            f"costs must be a mapping {{id: (c0, c1, c2)}} or None, "
+            f"got {type(costs).__name__}"
+        )
+    out = {}
+    for pid, triple in costs.items():
+        if not isinstance(pid, str) or pid not in pedigree:
+            raise ValidationError(f"costs[{pid!r}]: no such individual in pedigree")
+        if (
+            isinstance(triple, (str, bytes))
+            or not isinstance(triple, (tuple, list))
+            or len(triple) != 3
+        ):
+            raise ValidationError(
+                f"costs[{pid!r}] must be a (c0, c1, c2) triple, got {triple!r}"
+            )
+        vals = []
+        for v, c in zip(GENOTYPES, triple):
+            if c is None:
+                vals.append(None)
+                continue
+            if isinstance(c, bool) or not isinstance(c, int):
+                raise ValidationError(
+                    f"costs[{pid!r}][{v}] must be None or an int >= 0 "
+                    f"(bool/float rejected), got {c!r}"
+                )
+            if c < 0:
+                raise ValidationError(
+                    f"costs[{pid!r}][{v}] must be >= 0, got {c!r}"
+                )
+            vals.append(c)
+        out[pid] = tuple(vals)
+    return out
+
+
+def _domain_min_cost(mask: int, costs) -> int:
+    """域内最小单项代价。域已剔除 None（禁止）项，故取最小值安全。"""
+    return min(costs[v] for v in GENOTYPES if (mask >> v) & 1)
+
+
+def _lower_bound(domains, var_costs) -> int:
+    return sum(_domain_min_cost(mask, var_costs[i]) for i, mask in enumerate(domains))
+
+
+def _bnb(domains, model: _Model, var_costs, budget: _Budget, best: list) -> None:
+    """分支定界求最小总代价，结果写入 best[0]（无可行解则保持 None）。"""
+    budget.tick()
+    if not _propagate(domains, model):
+        return
+    lb = 0
+    var = -1
+    best_pc = 4
+    for i, mask in enumerate(domains):
+        if mask == 0:
+            return
+        lb += _domain_min_cost(mask, var_costs[i])
+        pc = mask.bit_count()
+        if 1 < pc < best_pc:
+            best_pc = pc
+            var = i
+    if best[0] is not None and lb >= best[0]:
+        return
+    if var < 0:
+        best[0] = lb  # 全部变量已定型，lb 即该指派的精确总代价
+        return
+    for v in _values(domains[var]):
+        child = list(domains)
+        child[var] = 1 << v
+        _bnb(child, model, var_costs, budget, best)
+
+
+def _bounded_sat(domains, model: _Model, var_costs, budget: _Budget, bound: int) -> bool:
+    """是否存在总代价 <= bound 的可行指派。"""
+    budget.tick()
+    if not _propagate(domains, model):
+        return False
+    lb = 0
+    var = -1
+    best_pc = 4
+    for i, mask in enumerate(domains):
+        if mask == 0:
+            return False
+        lb += _domain_min_cost(mask, var_costs[i])
+        pc = mask.bit_count()
+        if 1 < pc < best_pc:
+            best_pc = pc
+            var = i
+    if lb > bound:
+        return False
+    if var < 0:
+        return True
+    for v in _values(domains[var]):
+        child = list(domains)
+        child[var] = 1 << v
+        if _bounded_sat(child, model, var_costs, budget, bound):
+            return True
+    return False
+
+
+def _lex_witness(domains, model: _Model, var_costs, budget: _Budget, bound: int, order):
+    """按固定变量序（实个体按 ID 字典序在前）、值升序找第一个代价 <= bound 的解。
+
+    第一个找到的完整指派即“人物 ID 序列上基因型字典序最小”的最优见证。
+    """
+    budget.tick()
+    if not _propagate(domains, model):
+        return None
+    if any(mask == 0 for mask in domains):
+        return None
+    if _lower_bound(domains, var_costs) > bound:
+        return None
+    var = -1
+    for i in order:
+        if domains[i].bit_count() > 1:
+            var = i
+            break
+    if var < 0:
+        return [mask.bit_length() - 1 for mask in domains]
+    for v in _values(domains[var]):
+        child = list(domains)
+        child[var] = 1 << v
+        sol = _lex_witness(child, model, var_costs, budget, bound, order)
+        if sol is not None:
+            return sol
+    return None
+
+
+def optimize(pedigree, observations, costs=None, *, node_budget: int = DEFAULT_NODE_BUDGET) -> OptimizeResult:
+    """带软代价的单基因座孟德尔家系优化。契约见模块 docstring。"""
+    model = _validate_and_build(pedigree, observations, node_budget)
+    cost_map = _validate_costs(pedigree, costs)
+    n_real = len(model.ids)
+    n_var = len(model.domains0)
+    var_costs = [
+        cost_map.get(model.ids[i], (0, 0, 0)) if i < n_real else (0, 0, 0)
+        for i in range(n_var)
+    ]
+    # 硬观测先限制候选，再剔除禁止项；两者冲突 -> 域为空 -> 证明无解。
+    domains = list(model.domains0)
+    for i in range(n_real):
+        pid = model.ids[i]
+        mask = 0
+        for v in GENOTYPES:
+            if var_costs[i][v] is not None:
+                mask |= 1 << v
+        if pid in model.obs:
+            mask &= 1 << model.obs[pid]
+        domains[i] = mask
+
+    budget = _Budget(node_budget)
+    best = [None]
+    proven = False
+    try:
+        _bnb(list(domains), model, var_costs, budget, best)
+        proven = True
+        if best[0] is None:
+            return OptimizeResult(
+                status="infeasible",
+                min_cost=None,
+                optimal_genotypes=None,
+                witness=None,
+                best_cost_bound=None,
+                nodes_used=budget.used,
+            )
+        bound = best[0]
+        base = list(domains)
+        if not _propagate(base, model):  # 已知可行，传播不可能失败
+            raise AssertionError("internal: propagation failed on a feasible instance")
+        optimal = {}
+        for i in range(n_real):
+            vals = set()
+            for v in _values(base[i]):  # 弧一致已剪掉的值必然不在任何最优解中
+                trial = list(base)
+                trial[i] = 1 << v
+                if _bounded_sat(trial, model, var_costs, budget, bound):
+                    vals.add(v)
+            optimal[model.ids[i]] = frozenset(vals)
+        order = sorted(range(n_real), key=lambda i: model.ids[i]) + list(
+            range(n_real, n_var)
+        )
+        sol = _lex_witness(list(domains), model, var_costs, budget, bound, order)
+        if sol is None:  # 最优性已证明，必有解
+            raise AssertionError("internal: no optimal witness found")
+        witness = {pid: sol[model.index[pid]] for pid in model.ids}
+        return OptimizeResult(
+            status="optimal",
+            min_cost=bound,
+            optimal_genotypes=optimal,
+            witness=witness,
+            best_cost_bound=bound,
+            nodes_used=budget.used,
+        )
+    except _BudgetExhausted:
+        # 区分：best[0] 是可行上界；仅当分支定界已完整结束（proven）时
+        # 它才是已证明最优。optimal_genotypes/witness 绝不给出未证明结果。
+        return OptimizeResult(
+            status="unknown",
+            min_cost=best[0] if proven else None,
+            optimal_genotypes=None,
+            witness=None,
+            best_cost_bound=best[0],
             nodes_used=node_budget,
         )
