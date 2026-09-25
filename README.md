@@ -1,12 +1,25 @@
-# mendelcheck — 孟德尔家系单基因座最小冲突定位
+# mendelcheck — 孟德尔家系单基因座校验：冲突定位 + 同祖拷贝（IBD）概率
 
 离线遗传数据校验的可复用模块：对单二等位位点校验家系观测的孟德尔一致性；
 不一致时定位最少需移除的观测集合，并给出每个被移除观测的修正见证。
+本轮新增：**不使用观察基因型**的单个位点 IBD 查询——给每个无亲缘创始人的
+两份拷贝不同标签，枚举子女的随机继承，输出两名成员共享 0/1/2 份同祖拷贝的
+精确概率（`Fraction`）。
 
 ## 环境
 
 - Python 3.14.7，仅标准库，**无需安装任何第三方依赖**（`requirements.txt` 为空约定说明）。
 - Linux 原生运行；核心、测试、演示全部离线，不需要网络、账号、数据库或 Docker。
+
+### venv 准备
+
+```bash
+python3.14 -m venv .venv
+source .venv/bin/activate
+python --version   # Python 3.14.7
+```
+
+不激活 venv 时直接用系统 `python`（须为 3.14.7）亦可。
 
 ## 接口
 
@@ -15,6 +28,48 @@ from mendelcheck import check, CheckResult, ConflictReport, ValidationError
 
 result = check(pedigree, observations, *, node_budget=100_000)
 ```
+
+## IBD 查询接口
+
+```python
+from mendelcheck import ibd_sharing, IBDResult, ValidationError
+
+result = ibd_sharing(pedigree, "C", "D")
+result.p0, result.p1, result.p2          # fractions.Fraction，三者之和恒为 1
+result.shared_counts                      # {0: p0, 1: p1, 2: p2}
+result.transmissions                      # 枚举的独立二选一传递次数
+```
+
+### 遗传模型
+
+- 不读取、也不接受观察基因型；每个无亲缘（无记录）创始人的两份拷贝各带一个
+  **不同标签**；缺失亲本槽位（`None`）对每个子女是**独立**合成创始人。
+- 每名非创始子女从父亲方向、母亲方向各独立做一次均匀 1/2 的二选一继承。
+- 允许近亲婚配（同一祖先出现在多条路径上）；家系的亲子图必须无有向环，
+  非法家系抛 `ValidationError`（与 `check` 同一套家系校验，报出环路径）。
+- 共享份数 = 两人两份标签**多重集的最大匹配数**：同一份祖先标签至多匹配
+  一次。近交个体自身两份标签可能相同，但与同一外人的同一标签也只计一份。
+- 概率全部为 `fractions.Fraction` 精确值，无浮点误差（演示中的小数仅为展示）。
+
+### 枚举规模与错误语义
+
+- 独立二选一传递总数 = 2 ×（至少有一名登记父母的子女数），上限
+  `MAX_IBD_TRANSMISSIONS = 12`，即至多枚举 2^12 = 4096 个等概率组合；
+  超出抛 `ValidationError`。家系成员总数仍受 `MAX_INDIVIDUALS = 20` 约束。
+- 两名查询成员都必须是家系内的非空 `str`，否则抛 `ValidationError`。
+- 允许 `id1 == id2`：此时自身两份拷贝与自身完全匹配，恒为 `P(2)=1`。
+- 纯创始人家系传递数为 0，枚举仅 1 个组合（创始人之间共享恒为 0）。
+
+### 基准结果（精确）
+
+| 关系 | P(0) | P(1) | P(2) |
+|---|---|---|---|
+| 无亲缘创始人 | 1 | 0 | 0 |
+| 亲子 | 0 | 1 | 0 |
+| 全同胞 | 1/4 | 1/2 | 1/4 |
+| 半同胞（共一亲） | 1/2 | 1/2 | 0 |
+| 同胞婚配的子代 E 与祖父 A | 1/4 | 5/8 | 1/8 |
+| 同胞婚配的子代 E 与父亲 C | 0 | 3/4 | 1/4 |
 
 ### 输入契约
 
@@ -61,9 +116,14 @@ result = check(pedigree, observations, *, node_budget=100_000)
 ## 运行
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（含独立穷举参考对照）
-python demo.py                            # 固定输入演示，约 0.1 秒内完成
+python -m unittest discover -s tests -v   # 全部必要测试（含两套独立穷举参考对照）
+python demo.py                            # 冲突定位固定输入演示，约 0.1 秒
+python demo_iteration.py                  # IBD 查询固定输入演示（正常 + 边界，远小于 90 秒）
 ```
+
+两套演示均为真实计算，不使用 `sleep`、不预录输出；`tests/test_ibd.py` 中的
+独立参考递归枚举每次减数分裂选择、自行发放创始人标签，不调用被测核心
+`mendelcheck` 产生期望值，并核对每个用例概率和为 1。
 
 ## 设计取舍
 
@@ -87,8 +147,13 @@ python demo.py                            # 固定输入演示，约 0.1 秒内�
 - 最小移除集枚举上限 256 个（超出时 `truncated=True`，已返回的集合仍保证最小基数）。
 - 见证语义为“相对包含该观测的首个最小移除集重新可行”，不保证单独移除
   该观测即可行（多个不相交冲突时单移除一个不充分）。
+- IBD 查询是**有限标签传递教学/校验模型**：每个亲本方向独立均匀二选一，
+  不使用观察基因型，不建模交叉互换/重组、选择、群体等位频率或真实人群结构；
+  **不能作为真实个体的遗传风险、亲缘鉴定或医疗评估依据**。
+- IBD 枚举上限 12 次传递（4096 个组合）；上限是接口边界而非算法能力承诺。
 
 ## 误差口径
 
 本库输出全部为**精确离散结果**（基因型集合、ID 元组、整数指派），
-不涉及任何浮点计算，无数值误差、无容差判定。
+不涉及任何浮点计算，无数值误差、无容差判定。IBD 概率为精确有理数
+（`fractions.Fraction`），每次枚举都核对 `p0+p1+p2 == 1`。

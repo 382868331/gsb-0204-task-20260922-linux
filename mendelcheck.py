@@ -31,27 +31,45 @@
 所有非法输入抛出 ValidationError（ValueError 子类），消息定位到具体
 个体 ID / 字段。本库不做任何静默纠正，输出全部为精确离散结果，
 不涉及浮点计算。
+
+单位点 IBD 查询（本轮新增，不使用观察基因型）：
+
+    ibd_sharing(pedigree, id1, id2) -> IBDResult
+
+- 每个无亲缘创始人的两份拷贝带不同标签；缺失亲本槽位是独立合成创始人；
+- 每名非创始子女对父、母方向各独立做一次均匀 1/2 二选一继承；
+- 允许近亲婚配的多条祖先路径，但亲子图必须无有向环；
+- 共享份数为两人两份标签多重集的最大匹配数（同一祖先标签不重复匹配）；
+- 独立二选一传递至多 MAX_IBD_TRANSMISSIONS=12 次（枚举 <= 4096 组合），
+  超出抛 ValidationError；p0/p1/p2 为 Fraction 且和恒为 1。
+
+本 IBD 模型是有限标签传递的教学/校验模型，不是真实个体风险评估。
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Optional
 
 __all__ = [
     "check",
     "CheckResult",
     "ConflictReport",
+    "ibd_sharing",
+    "IBDResult",
     "MendelError",
     "ValidationError",
     "MAX_INDIVIDUALS",
+    "MAX_IBD_TRANSMISSIONS",
     "DEFAULT_NODE_BUDGET",
     "MAX_MINIMAL_SETS",
     "GENOTYPES",
 ]
 
 MAX_INDIVIDUALS = 20
+MAX_IBD_TRANSMISSIONS = 12
 DEFAULT_NODE_BUDGET = 100_000
 MAX_MINIMAL_SETS = 256
 GENOTYPES = (0, 1, 2)
@@ -120,6 +138,25 @@ class CheckResult:
     nodes_used: int
 
 
+@dataclass(frozen=True)
+class IBDResult:
+    """单位点 IBD 共享概率（不使用观察基因型）。
+
+    - p0/p1/p2: 两名成员恰好共享 0/1/2 份同祖拷贝的精确概率（Fraction）。
+    - shared_counts: {0: p0, 1: p1, 2: p2}。
+    - transmissions: 枚举的独立二选一减数分裂传递次数（每个非创始子女 2 次）。
+
+    共享份数按两名成员两份标签多重集的最大匹配数计算；同一份祖先标签
+    至多匹配一次（因此近交个体自身两份同标签与他人也至多贡献一份）。
+    """
+
+    p0: "Fraction"
+    p1: "Fraction"
+    p2: "Fraction"
+    shared_counts: dict
+    transmissions: int
+
+
 class _Model:
     """内部求解模型：实个体变量 + 每个缺失亲本槽位一个独立合成创始者变量。"""
 
@@ -172,14 +209,8 @@ def _check_acyclic(pedigree: Mapping) -> None:
                 path.pop()
 
 
-def _validate_and_build(pedigree, observations, node_budget) -> _Model:
-    if isinstance(node_budget, bool) or not isinstance(node_budget, int):
-        raise ValidationError(
-            f"node_budget must be an int >= 1 (bool/float rejected), got {node_budget!r}"
-        )
-    if node_budget < 1:
-        raise ValidationError(f"node_budget must be >= 1, got {node_budget!r}")
-
+def _validate_pedigree(pedigree: Mapping):
+    """校验家系结构并返回按插入序排列的个体 ID 列表。check 与 IBD 查询共用。"""
     if isinstance(pedigree, (str, bytes)) or not isinstance(pedigree, Mapping):
         raise ValidationError(
             f"pedigree must be a mapping {{id: (father, mother)}}, got {type(pedigree).__name__}"
@@ -216,6 +247,18 @@ def _validate_and_build(pedigree, observations, node_budget) -> _Model:
             if par == pid:
                 raise ValidationError(f"pedigree[{pid!r}] lists itself as {role}")
     _check_acyclic(pedigree)
+    return list(pedigree.keys())
+
+
+def _validate_and_build(pedigree, observations, node_budget) -> _Model:
+    if isinstance(node_budget, bool) or not isinstance(node_budget, int):
+        raise ValidationError(
+            f"node_budget must be an int >= 1 (bool/float rejected), got {node_budget!r}"
+        )
+    if node_budget < 1:
+        raise ValidationError(f"node_budget must be >= 1, got {node_budget!r}")
+
+    ids = _validate_pedigree(pedigree)
 
     if isinstance(observations, (str, bytes)) or not isinstance(observations, Mapping):
         raise ValidationError(
@@ -237,7 +280,7 @@ def _validate_and_build(pedigree, observations, node_budget) -> _Model:
         obs[pid] = g
 
     model = _Model()
-    model.ids = list(pedigree.keys())
+    model.ids = ids
     model.index = {pid: i for i, pid in enumerate(model.ids)}
     model.domains0 = [_FULL_MASK] * len(model.ids)
     model.adjacency = [[] for _ in model.ids]
@@ -447,3 +490,120 @@ def check(pedigree, observations, *, node_budget: int = DEFAULT_NODE_BUDGET) -> 
             conflict=None,
             nodes_used=node_budget,
         )
+
+
+# ---------------------------------------------------------------- 单位点 IBD 查询
+
+def _topo_order(pedigree, ids):
+    """Kahn 拓扑排序（家系已校验无有向环）；同序时保持 pedigree 插入序，结果确定。"""
+    remaining = set(ids)
+    ordered = []
+    while remaining:
+        ready = [
+            pid for pid in ids
+            if pid in remaining
+            and all(p is None or p not in remaining for p in pedigree[pid])
+        ]
+        for pid in ready:
+            remaining.discard(pid)
+            ordered.append(pid)
+    return ordered
+
+
+def _ibd_labels(pedigree, ordered, choices, edge_cursor):
+    """给定全部减数分裂选择位，计算每个体两份拷贝的祖先标签。
+
+    无亲缘（无记录）创始人的两份拷贝各自带不同标签；每个缺失亲本槽位是
+    独立的无亲缘合成创始人。choices 的每一位是一次父或母方向的二选一传递。
+    """
+    labels = {}
+    founder_seq = 0
+
+    def founder_pair():
+        nonlocal founder_seq
+        pair = (f"F{founder_seq}:0", f"F{founder_seq}:1")
+        founder_seq += 1
+        return pair
+
+    for pid in ordered:
+        fa, mo = pedigree[pid]
+        if fa is None and mo is None:
+            labels[pid] = founder_pair()
+            continue
+        inherited = []
+        for parent in (fa, mo):
+            if parent is None:
+                # 缺失亲本槽位：独立合成创始人，本次减数分裂仍二选一传一份
+                pair = founder_pair()
+                bit = (choices >> edge_cursor[0]) & 1
+                edge_cursor[0] += 1
+                inherited.append(pair[bit])
+            else:
+                bit = (choices >> edge_cursor[0]) & 1
+                edge_cursor[0] += 1
+                inherited.append(labels[parent][bit])
+        labels[pid] = (inherited[0], inherited[1])
+    return labels
+
+
+def _multiset_match(pair_x, pair_y) -> int:
+    """两份标签多重集的最大匹配数：同一份祖先标签至多匹配一次。"""
+    counts = {}
+    for tag in pair_x:
+        counts[tag] = counts.get(tag, 0) + 1
+    matched = 0
+    for tag in pair_y:
+        if counts.get(tag, 0) > 0:
+            counts[tag] -= 1
+            matched += 1
+    return matched
+
+
+def ibd_sharing(pedigree, id1, id2):
+    """枚举全部减数分裂传递组合，返回两名成员共享 0/1/2 份同祖拷贝的精确概率。
+
+    有限遗传模型（不使用观察基因型）：
+    - 每个无亲缘创始人的两份拷贝带不同标签，缺失亲本槽位是独立创始人；
+    - 每名非创始子女对父、母方向各独立做一次 1/2 二选一传递；
+    - 允许近亲婚配形成多条祖先路径，但家系图必须无有向环；
+    - 共享份数为两份标签多重集的最大匹配数（同一祖先标签不重复匹配）。
+
+    独立二选一传递总数 = 2 *（至少有一名记录在案父母的子女数），至多
+    MAX_IBD_TRANSMISSIONS=12（即至多枚举 2**12=4096 个等概率组合），
+    超出抛 ValidationError。结果用 Fraction 精确表示，p0+p1+p2 == 1。
+    """
+    ids = _validate_pedigree(pedigree)
+    for role, pid in (("id1", id1), ("id2", id2)):
+        if not isinstance(pid, str):
+            raise ValidationError(f"{role} must be a member id str, got {pid!r}")
+        if pid not in pedigree:
+            raise ValidationError(f"{role} {pid!r} is not a pedigree member")
+
+    ordered = _topo_order(pedigree, ids)
+    child_count = sum(
+        1 for pid in ordered if pedigree[pid][0] is not None or pedigree[pid][1] is not None
+    )
+    transmissions = 2 * child_count
+    if transmissions > MAX_IBD_TRANSMISSIONS:
+        raise ValidationError(
+            f"IBD query has {transmissions} independent transmissions, limit is "
+            f"{MAX_IBD_TRANSMISSIONS} (2 per non-founder child)"
+        )
+
+    counts = [0, 0, 0]
+    total = 1 << transmissions
+    cursor = [0]
+    for choices in range(total):
+        cursor[0] = 0
+        tagged = _ibd_labels(pedigree, ordered, choices, cursor)
+        shared = _multiset_match(tagged[id1], tagged[id2])
+        counts[shared] += 1
+
+    probs = {k: Fraction(counts[k], total) for k in (0, 1, 2)}
+    return IBDResult(
+        p0=probs[0],
+        p1=probs[1],
+        p2=probs[2],
+        shared_counts=probs,
+        transmissions=transmissions,
+    )
