@@ -5,9 +5,10 @@
 2. 多代隐含冲突 -> 最小移除集、多个最小解释与修正见证；
 3. 实际触发的拒绝边界（环状家系 -> ValidationError）；
 4. 节点预算耗尽 -> 明确的 unknown（与证明无解分开）。
+5. 候选亲子关系 -> 枚举完整选择，区分可行/成环/证明不可能。
 """
 
-from mendelcheck import ValidationError, check
+from mendelcheck import ValidationError, check, resolve
 
 
 def show_feasible():
@@ -66,8 +67,33 @@ def show_unknown():
     print(f"status = {res.status} (node_budget = 1)")
 
 
+def show_candidates():
+    print("\n=== 5. 候选亲子关系：哪些完整选择与观测相容 ===")
+    # C 的父亲未定，只可能是 F1 或 F2；观测 F1=0、F2=2、M=0、C=0。
+    # F2=2 只能传等位 1，与 C=0 矛盾 -> 唯一相容选择是 F1。
+    pedigree = {
+        "F1": (None, None), "F2": (None, None), "M": (None, None),
+        "C": (None, "M"),
+    }
+    observations = {"F1": 0, "F2": 2, "M": 0, "C": 0}
+    res = resolve(pedigree, observations, {("C", "father"): ("F1", "F2")})
+    print(f"status = {res.status} (nodes_used = {res.nodes_used})")
+    for choice in res.choices:
+        print(f"  相容选择: {choice}")
+    # 证明不可能：C 观测改为 2 时两个候选父亲都矛盾
+    res2 = resolve(pedigree, {**observations, "C": 2},
+                   {("C", "father"): ("F1", "F2")})
+    print(f"C 观测为 2 时: status = {res2.status}（证明不可能，choices={res2.choices}）")
+    # 祖先循环：让 A 的父亲候选包含其后代 B
+    ped_cycle = {"A": (None, None), "B": ("A", None), "C": (None, None)}
+    res3 = resolve(ped_cycle, {}, {("A", "father"): ("B", "C")})
+    print(f"成环选择被排除: cyclic = {list(res3.cyclic)}, "
+          f"可行 choices = {list(res3.choices)}")
+
+
 if __name__ == "__main__":
     show_feasible()
     show_conflict()
     show_rejection()
     show_unknown()
+    show_candidates()

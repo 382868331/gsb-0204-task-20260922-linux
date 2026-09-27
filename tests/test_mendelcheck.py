@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mendelcheck
 from mendelcheck import CheckResult, ValidationError, check
+from mendelcheck import PlacementResult, resolve
 
 TRANSMIT = ((0,), (0, 1), (1,))
 
@@ -334,6 +335,212 @@ class TestBudget(unittest.TestCase):
         ped = {"A": (None, None), "B": (None, None), "C": ("A", "B")}
         res = check(ped, {"A": 1}, node_budget=500)
         self.assertLessEqual(res.nodes_used, 500)
+
+
+# ------------------------------------------------- 候选亲子关系解析（resolve）
+
+def ref_has_cycle(pedigree):
+    """独立环检测：沿父母指针 DFS 找回到栈上节点的路径。"""
+    def reaches(start, target, seen):
+        if start == target:
+            return True
+        if start in seen or start not in pedigree:
+            return False
+        seen.add(start)
+        fa, mo = pedigree[start]
+        return reaches(fa, target, seen) or reaches(mo, target, seen)
+
+    for pid in pedigree:
+        fa, mo = pedigree[pid]
+        for par in (fa, mo):
+            if par is not None and reaches(par, pid, set()):
+                return True
+    return False
+
+
+def ref_resolve(pedigree, observations, parent_candidates):
+    """独立参考：枚举全部完整组合，返回 (可行选择列表, 成环选择列表)。
+
+    不调用 mendelcheck；可行性由 ref_solutions 穷举判定。
+    """
+    slots = sorted(parent_candidates)
+    feasible, cyclic = [], []
+    for picked in itertools.product(*(sorted(parent_candidates[s]) for s in slots)):
+        concrete = {pid: list(par) for pid, par in pedigree.items()}
+        for (child, role), parent in zip(slots, picked):
+            concrete[child]["fm".index(role[0])] = parent
+        concrete = {pid: tuple(par) for pid, par in concrete.items()}
+        choice = dict(zip(slots, picked))
+        if ref_has_cycle(concrete):
+            cyclic.append(choice)
+        elif ref_solutions(concrete, observations):
+            feasible.append(choice)
+    return feasible, cyclic
+
+
+class TestResolve(unittest.TestCase):
+    def ped(self):
+        # F1/F2 都可能（互斥地）是 C 的父亲；M 是 C 的母亲。
+        return {
+            "F1": (None, None), "F2": (None, None), "M": (None, None),
+            "C": (None, "M"),
+        }
+
+    def test_candidates_narrowed_by_observations(self):
+        # F1=0、F2=2、M=0、C=1：父必须能传等位 1 -> 只有 F2 不可能（2 只能传1?）
+        # F1=0 只能传 0 -> C 只能是 0/1；F2=2 只能传 1 -> C 只能是 1/2。
+        # C=1 两者皆可能；改 C=0 则只有 F1 相容。
+        ped = self.ped()
+        res = resolve(ped, {"F1": 0, "F2": 2, "M": 0, "C": 0},
+                      {("C", "father"): ("F1", "F2")})
+        self.assertIsInstance(res, PlacementResult)
+        self.assertEqual(res.status, "feasible")
+        self.assertEqual(res.choices, ({("C", "father"): "F1"},))
+        self.assertEqual(res.cyclic, ())
+
+    def test_identity_consistency_across_relations(self):
+        # 同一个人 X 同时是 C1、C2 的候选父亲：X 的基因型只有一份，
+        # 不能对 C1 解释为一种、对 C2 解释为另一种。
+        # X=0（观测）时两个子女都观测为 2 -> 选 X 不可行，只有 Y 可行。
+        ped = {
+            "X": (None, None), "Y": (None, None), "M": (None, None),
+            "C1": (None, "M"), "C2": (None, "M"),
+        }
+        obs = {"X": 0, "Y": 2, "M": 1, "C1": 2, "C2": 2}
+        cands = {("C1", "father"): ("X", "Y"), ("C2", "father"): ("X", "Y")}
+        res = resolve(ped, obs, cands)
+        self.assertEqual(res.status, "feasible")
+        self.assertEqual(
+            res.choices,
+            ({("C1", "father"): "Y", ("C2", "father"): "Y"},),
+        )
+        # 与独立参考对照
+        want, want_cyc = ref_resolve(ped, obs, cands)
+        self.assertEqual(list(res.choices), want)
+        self.assertEqual(list(res.cyclic), want_cyc)
+
+    def test_cycle_choices_excluded(self):
+        # 选自己的后代当父亲会形成祖先循环 -> 记入 cyclic，与基因型无关。
+        ped = {"A": (None, None), "B": ("A", None), "C": (None, None)}
+        cands = {("A", "father"): ("B", "C")}
+        res = resolve(ped, {}, cands)
+        self.assertEqual(res.status, "feasible")
+        self.assertEqual(res.choices, ({("A", "father"): "C"},))
+        self.assertEqual(res.cyclic, ({("A", "father"): "B"},))
+        want, want_cyc = ref_resolve(ped, {}, cands)
+        self.assertEqual(list(res.choices), want)
+        self.assertEqual(list(res.cyclic), want_cyc)
+
+    def test_proven_impossible(self):
+        # 两个候选父亲都与观测矛盾 -> 证明不可能（非 unknown）。
+        ped = self.ped()
+        obs = {"F1": 0, "F2": 0, "M": 0, "C": 2}
+        res = resolve(ped, obs, {("C", "father"): ("F1", "F2")})
+        self.assertEqual(res.status, "infeasible")
+        self.assertEqual(res.choices, ())
+        self.assertEqual(res.cyclic, ())
+
+    def test_budget_exhaustion_is_unknown(self):
+        ped = self.ped()
+        res = resolve(ped, {}, {("C", "father"): ("F1", "F2")}, node_budget=1)
+        self.assertEqual(res.status, "unknown")
+        self.assertIsNone(res.choices)
+        # 同一实例预算充足时证明可行，与 unknown 严格分开
+        res2 = resolve(ped, {}, {("C", "father"): ("F1", "F2")})
+        self.assertEqual(res2.status, "feasible")
+
+    def test_empty_candidates_matches_check(self):
+        ped = self.ped()
+        res = resolve(ped, {"M": 0}, {})
+        self.assertEqual(res.status, "feasible")
+        self.assertEqual(res.choices, ({},))
+        bad = resolve(ped, {"M": 0, "C": 2}, {})
+        self.assertEqual(bad.status, "infeasible")
+        self.assertEqual(bad.choices, ())
+
+    def test_validation_errors(self):
+        ped = self.ped()
+        good = {("C", "father"): ("F1", "F2")}
+        # 非映射 / 非法键 / 非法角色
+        with self.assertRaises(ValidationError):
+            resolve(ped, {}, "nope")
+        with self.assertRaises(ValidationError):
+            resolve(ped, {}, {"C": ("F1",)})
+        with self.assertRaises(ValidationError):
+            resolve(ped, {}, {("C", "parent"): ("F1",)})
+        # 子女未知 / 槽位已被 pedigree 指定
+        with self.assertRaises(ValidationError):
+            resolve(ped, {}, {("Z", "father"): ("F1",)})
+        with self.assertRaises(ValidationError):
+            resolve(ped, {}, {("C", "mother"): ("F1",)})
+        # 候选为空 / 非成员 / 自身 / 重复
+        with self.assertRaises(ValidationError):
+            resolve(ped, {}, {("C", "father"): ()})
+        with self.assertRaises(ValidationError):
+            resolve(ped, {}, {("C", "father"): ("ZZ",)})
+        with self.assertRaises(ValidationError):
+            resolve(ped, {}, {("C", "father"): ("C",)})
+        with self.assertRaises(ValidationError):
+            resolve(ped, {}, {("C", "father"): ("F1", "F1")})
+        # 正常调用不抛错
+        self.assertEqual(resolve(ped, {}, good).status, "feasible")
+
+    def test_combination_limit(self):
+        ped = {f"I{i}": (None, None) for i in range(20)}
+        cands = {("I0", "father"): tuple(f"I{i}" for i in range(1, 20))}
+        # 19 个候选 -> 19 种组合，低于上限，不抛错
+        self.assertIn(resolve(ped, {}, cands).status, ("feasible", "infeasible"))
+        big = dict(cands)
+        for slot in range(1, 6):  # 19^6 远超 MAX_CHOICE_COMBINATIONS
+            big[(f"I{slot}", "father")] = tuple(
+                f"I{i}" for i in range(1, 20) if i != slot
+            )
+        with self.assertRaises(ValidationError):
+            resolve(ped, {}, big)
+
+    def test_against_brute_force_random(self):
+        for seed in range(30):
+            rng = random.Random(31600000 + seed)
+            n = rng.randint(3, 7)
+            ped = make_rng_pedigree(rng, n)
+            ids = list(ped)
+            # 随机挑 1-2 个已指定的亲本槽位改为候选（置 None 后给候选名单）
+            ped = dict(ped)
+            cands = {}
+            movable = [
+                (cid, ri)
+                for cid, par in ped.items()
+                for ri in (0, 1)
+                if par[ri] is not None
+            ]
+            rng.shuffle(movable)
+            for cid, ri in movable[: rng.randint(1, 2)]:
+                par = list(ped[cid])
+                par[ri] = None
+                ped[cid] = tuple(par)
+                pool = [x for x in ids if x != cid]
+                rng.shuffle(pool)
+                cands[(cid, "father" if ri == 0 else "mother")] = tuple(
+                    pool[: rng.randint(1, 3)]
+                )
+            obs = {pid: rng.randint(0, 2) for pid in ids if rng.random() < 0.5}
+            res = resolve(ped, obs, cands)
+            self.assertNotEqual(res.status, "unknown", f"seed={seed}")
+            want, want_cyc = ref_resolve(ped, obs, cands)
+            got = [dict(c) for c in res.choices]
+            self.assertEqual(
+                sorted(map(lambda d: sorted(d.items()), got)),
+                sorted(map(lambda d: sorted(d.items()), want)),
+                f"seed={seed}",
+            )
+            self.assertEqual(
+                sorted(map(lambda d: sorted(d.items()), map(dict, res.cyclic))),
+                sorted(map(lambda d: sorted(d.items()), want_cyc)),
+                f"seed={seed}",
+            )
+            self.assertEqual(
+                res.status, "feasible" if want else "infeasible", f"seed={seed}"
+            )
 
 
 # ------------------------------------------------- 穷举参考对照（随机小实例）

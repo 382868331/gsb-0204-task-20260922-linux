@@ -16,6 +16,19 @@ from mendelcheck import check, CheckResult, ConflictReport, ValidationError
 result = check(pedigree, observations, *, node_budget=100_000)
 ```
 
+候选亲子关系（部分亲缘未定、仅知有限候选名单）：
+
+```python
+from mendelcheck import resolve, PlacementResult
+
+result = resolve(
+    pedigree,
+    observations,
+    {("C", "father"): ("F1", "F2")},   # C 的父亲未定，只可能来自名单
+    node_budget=100_000,
+)
+```
+
 ### 输入契约
 
 - `pedigree: dict[str, tuple[str | None, str | None]]`
@@ -27,6 +40,17 @@ result = check(pedigree, observations, *, node_budget=100_000)
   未观测个体基因型未知，可取三者。
 - `node_budget: int`（关键字参数，默认 `100_000`）
   整个 `check` 调用共享的搜索节点预算，须为 `int >= 1`。
+
+### `resolve` 的额外输入
+
+- `parent_candidates: dict[tuple[str, str], tuple[str, ...]]`
+  键为 `(子女ID, "father" | "mother")`，值为候选父母 ID 的非空元组/列表。
+  对应槽位在 `pedigree` 中必须为 `None`（尚未确定）。
+  每个候选必须是家系内成员：**同一个人在整个家系中只有一份身份与观测**——
+  被选为父母后，其观测与亲缘约束在所有关系里同时生效，
+  不能在不同关系里采用不同解释（与缺失父母的“独立未知创始者”语义不同）。
+- 各候选列表长度的乘积（完整组合总数）不得超过
+  `MAX_CHOICE_COMBINATIONS = 100_000`，超出抛出 `ValidationError`。
 
 ### 返回 `CheckResult`
 
@@ -46,6 +70,19 @@ result = check(pedigree, observations, *, node_budget=100_000)
   指派。该指派满足全部孟德尔约束及“原观测减去包含该 ID 的首个最小移除集”后
   保留的观测，即修正后的**重新可行见证**。
 - `truncated: bool` —— 最小移除集总数超过 `MAX_MINIMAL_SETS`（256）被截断时为 `True`。
+
+### 返回 `PlacementResult`（`resolve`）
+
+| 字段 | 含义 |
+|---|---|
+| `status` | `"feasible"` / `"infeasible"` / `"unknown"` |
+| `choices` | 可行时：全部与观测相容的完整选择（每个为 `{(子女ID, 角色): 父母ID}` 字典，确定性排序）；证明不可能时为空元组；`unknown` 时为 `None` |
+| `cyclic` | 因形成祖先循环而被排除的完整选择（同结构元组），与预算无关、始终完整枚举 |
+| `nodes_used` | 实际消耗的搜索节点数 |
+
+- `"feasible"`：仍有可行选择（`choices` 非空，已穷尽全部组合）。
+- `"infeasible"`：全部组合已穷尽且无一相容——**已确认不可能**（证明，非预算耗尽）。
+- `"unknown"`：节点预算耗尽，**搜索尚未完成**，`choices` 为 `None`。
 
 ### 状态与错误语义
 
@@ -78,6 +115,10 @@ python demo.py                            # 固定输入演示，约 0.1 秒内�
   直接产出，不额外消耗搜索。
 - **缺失父母**：每个 (子女, 缺失亲本槽位) 引入一个独立合成创始者变量，
   严格实现题面“独立未知创始者”语义。
+- **候选亲子关系**：`resolve` 先对全部完整组合做无预算的环检测（成环组合
+  记入 `cyclic` 并排除），再把每组选择具体化为确定家系，复用同一
+  AC-3 + 分支求解器在共享预算内逐一检验；候选父母是家系内的真实个体，
+  其观测与身份在所有关系中一致生效。
 
 ## 已知限制
 
@@ -85,6 +126,9 @@ python demo.py                            # 固定输入演示，约 0.1 秒内�
   不宣称兼容任何行业标准格式（如 PED/LINKAGE）。
 - 规模上限 20 人；最坏情况搜索为指数级，预算耗尽返回 `unknown` 而非错误结论。
 - 最小移除集枚举上限 256 个（超出时 `truncated=True`，已返回的集合仍保证最小基数）。
+- 候选亲子关系的完整组合总数上限 `MAX_CHOICE_COMBINATIONS = 100_000`（输入规模限制，
+  超出抛 `ValidationError`）；组合逐一求解共享同一节点预算，预算耗尽返回
+  `unknown` 而非部分结论。
 - 见证语义为“相对包含该观测的首个最小移除集重新可行”，不保证单独移除
   该观测即可行（多个不相交冲突时单移除一个不充分）。
 

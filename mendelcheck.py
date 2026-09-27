@@ -28,6 +28,27 @@
 - status == "unknown":    节点预算耗尽，既未证明可行也未证明无解；
                           feasible_genotypes 与 conflict 均为 None。
 
+另提供候选亲子关系解析：
+
+    resolve(pedigree, observations, parent_candidates, *, node_budget=...) -> PlacementResult
+
+- parent_candidates: dict，键为 (子女ID, "father"|"mother")，值为候选父母 ID
+  的非空元组/列表。对应槽位在 pedigree 中必须为 None（未确定）。
+  每个候选必须是家系内成员——同一个人在整个家系中只有一份身份与观测，
+  被选为父母后其观测与亲缘约束在所有关系里同时生效，不做按槽位的独立解释。
+- resolve 枚举候选的全部完整组合：会形成祖先循环的组合被排除（记入 cyclic），
+  其余组合逐一在共享节点预算内检验孟德尔一致性。
+- 返回 PlacementResult：
+    - status == "feasible":   choices 为全部与观测相容的完整选择（每个为
+                              {(子女ID, 角色): 父母ID} 字典，确定性排序）；
+    - status == "infeasible": 全部组合已穷尽且无一相容（证明不可能），
+                              choices 为空元组；
+    - status == "unknown":    节点预算耗尽，搜索尚未完成，choices 为 None；
+    - cyclic:                 因形成祖先循环而被排除的完整选择（与预算无关，
+                              始终完整）；unknown 时 choices 无法保证完整故为 None。
+  组合总数（各候选列表长度的乘积）超过 MAX_CHOICE_COMBINATIONS 时抛出
+  ValidationError（输入规模上限，与 MAX_INDIVIDUALS 同类）。
+
 所有非法输入抛出 ValidationError（ValueError 子类），消息定位到具体
 个体 ID / 字段。本库不做任何静默纠正，输出全部为精确离散结果，
 不涉及浮点计算。
@@ -37,23 +58,28 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from itertools import product
 from typing import Optional
 
 __all__ = [
     "check",
+    "resolve",
     "CheckResult",
+    "PlacementResult",
     "ConflictReport",
     "MendelError",
     "ValidationError",
     "MAX_INDIVIDUALS",
     "DEFAULT_NODE_BUDGET",
     "MAX_MINIMAL_SETS",
+    "MAX_CHOICE_COMBINATIONS",
     "GENOTYPES",
 ]
 
 MAX_INDIVIDUALS = 20
 DEFAULT_NODE_BUDGET = 100_000
 MAX_MINIMAL_SETS = 256
+MAX_CHOICE_COMBINATIONS = 100_000
 GENOTYPES = (0, 1, 2)
 
 # 基因型 g 在减数分裂中可传出的等位（0=参考，1=替代）。
@@ -117,6 +143,21 @@ class CheckResult:
     status: str
     feasible_genotypes: Optional[dict]
     conflict: Optional[ConflictReport]
+    nodes_used: int
+
+
+@dataclass(frozen=True)
+class PlacementResult:
+    """resolve() 的返回值。status ∈ {"feasible", "infeasible", "unknown"}。
+
+    choices: 与观测相容的全部完整选择（{(子女ID, 角色): 父母ID} 字典元组）；
+             unknown 时为 None。infeasible 时为空元组。
+    cyclic:  因形成祖先循环被排除的完整选择（同结构元组），始终完整枚举。
+    """
+
+    status: str
+    choices: Optional[tuple]
+    cyclic: tuple
     nodes_used: int
 
 
@@ -447,3 +488,141 @@ def check(pedigree, observations, *, node_budget: int = DEFAULT_NODE_BUDGET) -> 
             conflict=None,
             nodes_used=node_budget,
         )
+
+
+# ---------------------------------------------------------------- 候选亲子关系解析
+
+_ROLES = ("father", "mother")
+
+
+def _validate_candidates(pedigree: Mapping, parent_candidates) -> list:
+    """校验 parent_candidates，返回 [(子女ID, 角色, 候选ID元组)]，确定性排序。"""
+    if isinstance(parent_candidates, (str, bytes)) or not isinstance(
+        parent_candidates, Mapping
+    ):
+        raise ValidationError(
+            "parent_candidates must be a mapping {(child_id, role): (candidate_ids...)}, "
+            f"got {type(parent_candidates).__name__}"
+        )
+    slots = []
+    total = 1
+    for key, cands in parent_candidates.items():
+        if (
+            isinstance(key, (str, bytes))
+            or not isinstance(key, (tuple, list))
+            or len(key) != 2
+        ):
+            raise ValidationError(
+                f"parent_candidates key must be a (child_id, role) pair, got {key!r}"
+            )
+        child, role = key
+        if not isinstance(child, str) or child not in pedigree:
+            raise ValidationError(
+                f"parent_candidates key {key!r}: child {child!r} is not a pedigree member"
+            )
+        if role not in _ROLES:
+            raise ValidationError(
+                f"parent_candidates key {key!r}: role must be 'father' or 'mother', "
+                f"got {role!r}"
+            )
+        if pedigree[child][_ROLES.index(role)] is not None:
+            raise ValidationError(
+                f"parent_candidates key {key!r}: pedigree[{child!r}] already specifies "
+                f"a {role}; candidates require an unspecified (None) slot"
+            )
+        if (
+            isinstance(cands, (str, bytes))
+            or not isinstance(cands, (tuple, list))
+            or len(cands) == 0
+        ):
+            raise ValidationError(
+                f"parent_candidates[{key!r}] must be a non-empty tuple/list of "
+                f"candidate ids, got {cands!r}"
+            )
+        seen = set()
+        for cand in cands:
+            if not isinstance(cand, str) or cand not in pedigree:
+                raise ValidationError(
+                    f"parent_candidates[{key!r}] candidate {cand!r} is not a "
+                    "pedigree member"
+                )
+            if cand == child:
+                raise ValidationError(
+                    f"parent_candidates[{key!r}] candidate {cand!r} is the child itself"
+                )
+            if cand in seen:
+                raise ValidationError(
+                    f"parent_candidates[{key!r}] lists candidate {cand!r} more than once"
+                )
+            seen.add(cand)
+        ordered = tuple(sorted(seen))
+        total *= len(ordered)
+        if total > MAX_CHOICE_COMBINATIONS:
+            raise ValidationError(
+                f"parent_candidates yield more than {MAX_CHOICE_COMBINATIONS} "
+                "complete combinations (input size limit)"
+            )
+        slots.append((child, role, ordered))
+    slots.sort(key=lambda s: (s[0], s[1]))
+    return slots
+
+
+def _apply_choice(pedigree: Mapping, slots: list, picked: tuple) -> dict:
+    """按一组选择填充候选槽位，返回新的具体 pedigree 字典。"""
+    concrete = {pid: [fa, mo] for pid, (fa, mo) in pedigree.items()}
+    for (child, role, _cands), parent in zip(slots, picked):
+        concrete[child][_ROLES.index(role)] = parent
+    return {pid: (fa, mo) for pid, (fa, mo) in concrete.items()}
+
+
+def resolve(
+    pedigree,
+    observations,
+    parent_candidates,
+    *,
+    node_budget: int = DEFAULT_NODE_BUDGET,
+) -> PlacementResult:
+    """枚举候选亲子关系的全部完整选择，找出与观测相容者。契约见模块 docstring。"""
+    _validate_and_build(pedigree, observations, node_budget)  # 复用同一输入契约
+    slots = _validate_candidates(pedigree, parent_candidates)
+
+    # 先完整枚举组合并排除祖先循环（不消耗搜索预算），再逐一检验孟德尔一致性。
+    cyclic = []
+    pending = []
+    for picked in product(*(s[2] for s in slots)) if slots else [()]:
+        concrete = _apply_choice(pedigree, slots, picked)
+        try:
+            _check_acyclic(concrete)
+        except ValidationError:
+            cyclic.append(dict(zip(((s[0], s[1]) for s in slots), picked)))
+        else:
+            pending.append(concrete)
+
+    budget = _Budget(node_budget)
+    choices = []
+    try:
+        for concrete in pending:
+            model = _validate_and_build(concrete, observations, node_budget)
+            if _solve_obs(model, model.obs_ids, budget) is not None:
+                choices.append(concrete)
+    except _BudgetExhausted:
+        return PlacementResult(
+            status="unknown",
+            choices=None,
+            cyclic=tuple(cyclic),
+            nodes_used=node_budget,
+        )
+
+    def _choice_of(concrete):
+        return {
+            (child, role): concrete[child][_ROLES.index(role)]
+            for child, role, _cands in slots
+        }
+
+    chosen = tuple(_choice_of(c) for c in choices)
+    return PlacementResult(
+        status="feasible" if chosen else "infeasible",
+        choices=chosen,
+        cyclic=tuple(cyclic),
+        nodes_used=budget.used,
+    )
