@@ -13,7 +13,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mendelcheck
-from mendelcheck import CheckResult, ValidationError, check
+from mendelcheck import CheckResult, FeasibleLink, LinkResult, ValidationError, check, resolve_links
 
 TRANSMIT = ((0,), (0, 1), (1,))
 
@@ -86,6 +86,209 @@ def make_rng_pedigree(rng, n):
             mo = None
         ped[ids[i]] = (fa, mo)
     return ped
+
+
+# ------------------------------------------------- resolve_links 独立参考
+
+def ref_choice_slots(pedigree):
+    """返回不确定亲本槽位列表，顺序与 LinkResult.slots 相同。"""
+    slots = []
+    for cid, parents in pedigree.items():
+        for role, par in zip(("father", "mother"), parents):
+            if isinstance(par, (tuple, list)) and not isinstance(par, (str, bytes)):
+                slots.append((cid, role))
+    return slots
+
+
+def ref_materialize(pedigree, slot_pick):
+    """用 {槽位: 候选} 把不确定槽位替换为具体亲本，返回具体家系。"""
+    concrete = {}
+    for cid, (fa, mo) in pedigree.items():
+        nf = slot_pick[(cid, "father")] if isinstance(fa, (tuple, list)) else fa
+        nm = slot_pick[(cid, "mother")] if isinstance(mo, (tuple, list)) else mo
+        concrete[cid] = (nf, nm)
+    return concrete
+
+
+def ref_has_cycle(concrete):
+    """具体家系是否含祖先循环（沿亲本边）。"""
+    def reaches(start, target):
+        stack = list(p for p in concrete[start] if p is not None)
+        seen = set()
+        while stack:
+            node = stack.pop()
+            if node == target:
+                return True
+            if node in seen:
+                continue
+            seen.add(node)
+            stack.extend(p for p in concrete[node] if p is not None)
+        return False
+
+    return any(reaches(pid, pid) for pid in concrete)
+
+
+def ref_link_solutions(pedigree, observations):
+    """独立穷举：枚举全部完整选择，过滤成环者，返回相容 (concrete, assignment) 列表。"""
+    slots = ref_choice_slots(pedigree)
+    domains = []
+    for cid, role in slots:
+        pos = 0 if role == "father" else 1
+        raw = pedigree[cid][pos]
+        seen = []
+        for c in raw:
+            if c not in seen:
+                seen.append(c)
+        domains.append(seen)
+    out = []
+    for combo in itertools.product(*domains):
+        pick = dict(zip(slots, combo))
+        concrete = ref_materialize(pedigree, pick)
+        if ref_has_cycle(concrete):
+            continue
+        for assignment in ref_solutions(concrete, observations):
+            out.append((concrete, assignment))
+            break  # 每组选择只需一个见证，与被测一致
+    return slots, out
+
+
+def make_rng_choice_pedigree(rng, n):
+    """确定性生成含候选亲本槽位的小家系（候选只取更早个体，保证可成环检测）。"""
+    ids = [f"I{i}" for i in range(n)]
+    ped = {ids[0]: (None, None)}
+    for i in range(1, n):
+        earlier = ids[:i]
+
+        def pick():
+            if not earlier:
+                return None
+            r = rng.random()
+            if r < 0.35:
+                return rng.choice(earlier)
+            if r < 0.55:
+                k = rng.randint(1, min(3, len(earlier)))
+                return tuple(rng.sample(earlier, k))
+            return None
+
+        fa, mo = pick(), pick()
+        # 同一人同时占父母两槽（自交）允许，但去重避免两槽位引用同一候选列表别名问题
+        ped[ids[i]] = (fa, mo)
+    return ped
+
+
+class TestResolveLinks(unittest.TestCase):
+    def test_determined_father_candidates(self):
+        ped = {
+            "A": (None, None), "B": (None, None),
+            "M": (None, None),
+            "X": (["A", "B"], "M"),
+        }
+        # M=0：父 0 -> 子 {0,1}；观测 X=2 排除父=0。A=B=0 时两候选都排除。
+        res = resolve_links(ped, {"M": 0, "X": 2, "A": 0, "B": 0})
+        self.assertEqual(res.status, "infeasible")
+        self.assertEqual(res.feasible, ())
+        # X=0：两个候选都相容
+        res2 = resolve_links(ped, {"M": 0, "X": 0})
+        self.assertEqual(res2.status, "feasible")
+        picks = {f.selection[0] for f in res2.feasible}
+        self.assertEqual(picks, {"A", "B"})
+        for f in res2.feasible:
+            self.assertIsInstance(f, FeasibleLink)
+            self.assertTrue(ref_consistent(f.parents, f.assignment))
+            self.assertEqual(f.assignment["X"], 0)
+
+    def test_observations_disambiguate_candidate(self):
+        # A=0,B=2,M=0；X=1 要求父能传 1 -> 仅 B(=2 必传1) 相容。
+        ped = {"A": (None, None), "B": (None, None),
+               "M": (None, None), "X": (["A", "B"], "M")}
+        res = resolve_links(ped, {"A": 0, "B": 2, "M": 0, "X": 1})
+        self.assertEqual(res.status, "feasible")
+        self.assertEqual(len(res.feasible), 1)
+        self.assertEqual(res.feasible[0].selection, ("B",))
+        self.assertEqual(res.possible["X"]["father"], frozenset({"B"}))
+
+    def test_ancestor_cycle_choice_pruned(self):
+        # A 的父亲固定为 X；X 的父亲候选 {A,B}。选 A 形成 X<->A 环，必须剪枝。
+        ped = {"A": ("X", None), "X": (["A", "B"], None), "B": (None, None)}
+        res = resolve_links(ped, {})
+        self.assertEqual(res.status, "feasible")
+        self.assertEqual([f.selection for f in res.feasible], [("B",)])
+        # 若唯一候选会成环，则没有可行选择 -> infeasible（非异常）
+        ped_cycle_only = {"A": ("X", None), "X": (["A"], None)}
+        self.assertEqual(resolve_links(ped_cycle_only, {}).status, "infeasible")
+
+    def test_identity_is_global(self):
+        # 同一候选 A 同时作为两个子女的父亲；A=0 迫使两个子女都不能为 2。
+        ped = {"A": (None, None), "M1": (None, None), "M2": (None, None),
+               "X": (["A"], "M1"), "Y": (["A"], "M2")}
+        res = resolve_links(ped, {"M1": 0, "M2": 0, "X": 0, "Y": 2})
+        self.assertEqual(res.status, "infeasible")
+
+    def test_budget_unknown_keeps_partial(self):
+        ped = {"A": (None, None), "B": (None, None), "M": (None, None),
+               "X": (["A", "B"], "M")}
+        res = resolve_links(ped, {}, node_budget=1)
+        self.assertEqual(res.status, "unknown")
+        self.assertIsInstance(res, LinkResult)
+
+    def test_truncated_on_cap(self):
+        ped = {"A": (None, None), "B": (None, None), "M": (None, None),
+               "X": (["A", "B"], "M")}
+        res = resolve_links(ped, {}, max_feasible=1)
+        self.assertEqual(res.status, "feasible")
+        self.assertTrue(res.truncated)
+        self.assertEqual(len(res.feasible), 1)
+
+    def test_validation_of_candidate_slots(self):
+        with self.assertRaises(ValidationError):
+            resolve_links({"X": ([], None)}, {})  # 空候选
+        with self.assertRaises(ValidationError):
+            resolve_links({"X": (["Z"], None)}, {})  # 未知候选
+        with self.assertRaises(ValidationError):
+            resolve_links({"X": (["X"], None)}, {})  # 自候选
+        with self.assertRaises(ValidationError):
+            resolve_links({"X": ([1], None)}, {})  # 非 str
+        with self.assertRaises(ValidationError):
+            resolve_links({"X": (["A"], None)}, {}, max_feasible=0)
+        with self.assertRaises(ValidationError):
+            resolve_links({"X": (["A"], None)}, {}, max_feasible=True)
+        # check() 不接受候选名单
+        with self.assertRaises(ValidationError):
+            check({"X": (["A"], None)}, {})
+
+    def test_random_against_brute_force(self):
+        cases = 0
+        for seed in range(80):
+            rng = random.Random(77001 + seed)
+            n = rng.randint(2, 7)
+            ped = make_rng_choice_pedigree(rng, n)
+            obs = {pid: rng.randint(0, 2) for pid in ped if rng.random() < 0.5}
+            res = resolve_links(ped, obs)
+            self.assertNotEqual(res.status, "unknown", f"seed={seed}")
+            slots, ref = ref_link_solutions(ped, obs)
+            self.assertEqual(res.slots, tuple(slots), f"seed={seed}")
+            if not ref:
+                self.assertEqual(res.status, "infeasible", f"seed={seed}")
+                self.assertEqual(res.feasible, (), f"seed={seed}")
+            else:
+                self.assertEqual(res.status, "feasible", f"seed={seed}")
+                got = sorted(f.selection for f in res.feasible)
+                # 从参考 concrete 反推每组选择元组
+                want_selections = set()
+                for concrete, _a in ref:
+                    sel = tuple(
+                        concrete[cid][0 if role == "father" else 1]
+                        for cid, role in slots
+                    )
+                    want_selections.add(sel)
+                self.assertEqual(set(got), want_selections, f"seed={seed}")
+                for f in res.feasible:
+                    self.assertFalse(ref_has_cycle(f.parents), f"seed={seed}")
+                    self.assertTrue(ref_consistent(f.parents, f.assignment), f"seed={seed}")
+                    for pid, g in obs.items():
+                        self.assertEqual(f.assignment[pid], g)
+            cases += 1
+        self.assertEqual(cases, 80)
 
 
 # ------------------------------------------------- 校验与接口语义
